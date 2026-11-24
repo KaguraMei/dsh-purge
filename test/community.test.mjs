@@ -128,6 +128,7 @@ test("no host layout still blocks writes with a clear message", () => {
     assert.equal(none.level, "no-host");
     assert.equal(none.patch_writes_allowed, false);
     assert.throws(() => requirePatchCompatibility(empty), /未定位到宿主/);
+    assert.doesNotMatch(compatibility(empty).message, /自动继续|解开 app\.asar/);
   } finally {
     fs.rmSync(empty, { recursive: true, force: true });
   }
@@ -319,7 +320,7 @@ test("release checksum failure stops before installation", async () => {
   try {
     globalThis.fetch = async (url) =>
       new Response(
-        String(url).endsWith("sums")
+        String(url).endsWith("SHA256SUMS.txt")
           ? "0".repeat(64) + "  " + PACKAGE + "-1.2.0.tgz"
           : "wrong bytes",
       );
@@ -327,8 +328,8 @@ test("release checksum failure stops before installation", async () => {
       installRelease(f.manager, {
         ref: "v1.2.0",
         version: "1.2.0",
-        asset: "https://github.com/fixture/asset",
-        sums: "https://github.com/fixture/sums",
+        asset: "https://github.com/kingcharleslzy-ai/dsh-purge/releases/download/v1.2.0/dsh-purge-community-1.2.0.tgz",
+        sums: "https://github.com/kingcharleslzy-ai/dsh-purge/releases/download/v1.2.0/SHA256SUMS.txt",
       }, globalThis.fetch),
       /SHA256/,
     );
@@ -474,11 +475,12 @@ test('a failed fresh install quarantines partial package and retains user settin
       fs.writeFileSync(path.join(f.root, 'incomplete.js'), 'partial download');
       throw Error('fixture install failed');
     };
-    await assert.rejects(f.manager.install(f.candidate), /fixture install failed.*半安装目录已隔离/);
+    await assert.rejects(f.manager.install(f.candidate), /fixture install failed.*安装前依赖、安装与清单已恢复/);
     assert.equal(fs.existsSync(f.root), false);
-    const failed = fs.readdirSync(f.manager.base).filter(x => x.startsWith('failed-install-'));
+    const recovery = path.join(f.manager.base, 'install-recovery');
+    const failed = fs.readdirSync(recovery);
     assert.equal(failed.length, 1);
-    assert.equal(fs.readFileSync(path.join(f.manager.base, failed[0], 'incomplete.js'),'utf8'), 'partial download');
+    assert.equal(fs.readFileSync(path.join(recovery, failed[0], 'failed-node_modules', PACKAGE, 'incomplete.js'),'utf8'), 'partial download');
     assert.equal(fs.readFileSync(path.join(f.profile,'cordis.patch.yml'),'utf8'), 'PRIVATE CURRENT SETTINGS');
     assert.equal(fs.readFileSync(path.join(f.home,'prompt-inject.md'),'utf8'), 'PRIVATE USER PROMPT');
   } finally { f.close(); }
@@ -537,4 +539,114 @@ test('Windows native installer resolves archive path aliases without changing th
     assert.equal(supplied,fs.realpathSync.native(input));assert.notEqual(supplied,input);
     assert.deepEqual(fs.readFileSync(input),before);assert(fs.lstatSync(alias).isSymbolicLink());
   } finally {if(previous===undefined)delete process.env.PURGE_DSH_CLI;else process.env.PURGE_DSH_CLI=previous;f.close();}
+});
+
+test('failed install restores the complete dependency graph and lockfile, not just the manifest', async () => {
+  for (const stage of ['install','verify']) {
+    const f=setup();
+    try {
+      const manifest=fs.readFileSync(path.join(f.profile,'package.json'));
+      fs.writeFileSync(path.join(f.profile,'pnpm-lock.yaml'),'old lock');
+      f.manager.installer=async()=>{
+        const pkg=JSON.parse(manifest);pkg.dependencies[PACKAGE]='file:candidate';
+        fs.writeFileSync(path.join(f.profile,'package.json'),JSON.stringify(pkg));
+        fs.writeFileSync(path.join(f.profile,'pnpm-lock.yaml'),'new lock');
+        fs.writeFileSync(path.join(f.root,'client.js'),'partial replacement');
+        if(stage==='install')throw Error('download failure');
+      };
+      f.manager.verifier=async()=>{throw Error('dependency import failure');};
+      await assert.rejects(f.manager.install(f.candidate),/安装前依赖、安装与清单已恢复/);
+      assert.deepEqual(fs.readFileSync(path.join(f.profile,'package.json')),manifest);
+      assert.equal(fs.readFileSync(path.join(f.profile,'pnpm-lock.yaml'),'utf8'),'old lock');
+      assert.equal(fs.readFileSync(path.join(f.root,'client.js'),'utf8'),'original client');
+      assert.equal(fs.readFileSync(path.join(f.home,'prompt-inject.md'),'utf8'),'PRIVATE USER PROMPT');
+    } finally {f.close();}
+  }
+});
+test('install recovery refuses to erase concurrent unrelated dependency changes',async()=>{
+  const f=setup();
+  try {
+    f.manager.installer=async()=>{
+      const file=path.join(f.profile,'package.json'),pkg=JSON.parse(fs.readFileSync(file));
+      pkg.dependencies.concurrent='1.0.0';fs.writeFileSync(file,JSON.stringify(pkg));
+      throw Error('failure after concurrent change');
+    };
+    await assert.rejects(f.manager.install(f.candidate),/检测到并发配置变化，未覆盖/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.profile,'package.json'))).dependencies.concurrent,'1.0.0');
+    assert.equal(fs.readdirSync(path.join(f.manager.base,'install-recovery')).length,1);
+  } finally {f.close();}
+});
+
+test('install ownership loss preserves concurrent changes and recovery checkpoint', async () => {
+  const f = setup();
+  try {
+    f.manager.installer = async () => {
+      fs.writeFileSync(path.join(f.manager.base, 'maintenance.lock'), 'replacement-owner');
+      fs.writeFileSync(path.join(f.profile, 'cordis.patch.yml'), 'NEW OWNER SETTINGS');
+      const manifest=path.join(f.profile,'package.json');
+      const pkg=JSON.parse(fs.readFileSync(manifest,'utf8'));pkg.concurrentWriter=true;
+      fs.writeFileSync(manifest,JSON.stringify(pkg));
+    };
+    await assert.rejects(f.manager.install(f.candidate), /维护锁归属无法确认/);
+    assert.equal(fs.readFileSync(path.join(f.profile,'cordis.patch.yml'),'utf8'),'NEW OWNER SETTINGS');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.profile,'package.json'),'utf8')).concurrentWriter,true);
+    assert.equal(fs.readFileSync(path.join(f.manager.base,'maintenance.lock'),'utf8'),'replacement-owner');
+    assert(fs.readdirSync(path.join(f.manager.base,'install-recovery')).length>0);
+  } finally { f.close(); }
+});
+
+test('rollback ownership loss never restores over a new writer', async () => {
+  const f=setup();
+  try {
+    const backup=await f.manager.backup();
+    f.manager.installer=async()=>{
+      fs.writeFileSync(path.join(f.manager.base,'maintenance.lock'),'replacement-owner');
+      fs.writeFileSync(path.join(f.profile,'cordis.patch.yml'),'NEW OWNER SETTINGS');
+    };
+    await assert.rejects(f.manager.rollback(backup.id),/维护锁归属无法确认/);
+    assert.equal(fs.readFileSync(path.join(f.profile,'cordis.patch.yml'),'utf8'),'NEW OWNER SETTINGS');
+    assert.equal(fs.readFileSync(path.join(f.manager.base,'maintenance.lock'),'utf8'),'replacement-owner');
+    assert(f.manager.list().some(item=>item.id===backup.id));
+  } finally { f.close(); }
+});
+
+test('missing CLI preflight stops before profile installation or checkpoint mutation',async()=>{
+ const f=setup();try {
+  const before=fs.readFileSync(path.join(f.profile,'package.json'));
+  f.manager.preflight=()=>{throw Error('fixture CLI unavailable');};
+  await assert.rejects(f.manager.install(f.candidate),/fixture CLI unavailable/);
+  assert.deepEqual(fs.readFileSync(path.join(f.profile,'package.json')),before);
+  assert.equal(f.installs.length,0);
+  assert(!fs.existsSync(path.join(f.manager.base,'install-recovery')));
+ } finally {fs.rmSync(f.home,{recursive:true,force:true});}
+});
+
+test("failed migration restores exact disabled profile and floating dependency", async t => {
+  const fixture = setup();
+  t.after(fixture.close);
+  const manifest = path.join(fixture.profile, "package.json");
+  const previous = JSON.parse(fs.readFileSync(manifest));
+  previous.dependencies[PACKAGE] = "https://github.com/kingcharleslzy-ai/dsh-purge/releases/latest/download/dsh-purge-community.tgz";
+  previous.dsh.profile.bundles = ["unrelated-plugin"];
+  const original = JSON.stringify(previous, null, 2);
+  fs.writeFileSync(manifest, original);
+  fixture.manager.installer = async () => {
+    assert.match(JSON.parse(fs.readFileSync(manifest)).dependencies[PACKAGE], /^file:/);
+    throw Error("fixture installer failure");
+  };
+  await assert.rejects(fixture.manager.install(fixture.candidate), /fixture installer failure/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), original);
+  assert.equal(fs.readFileSync(path.join(fixture.profile, "cordis.patch.yml"), "utf8"), "PRIVATE CURRENT SETTINGS");
+});
+
+test("an installer can initialize a fresh profile manifest", async t => {
+  const fixture = setup();
+  t.after(fixture.close);
+  const manifest = path.join(fixture.profile, "package.json");
+  fs.unlinkSync(manifest);
+  fixture.manager.installer = async () => {
+    fs.writeFileSync(manifest, JSON.stringify({private:true}));
+  };
+  await fixture.manager.install(fixture.candidate);
+  assert.deepEqual(JSON.parse(fs.readFileSync(manifest)).dsh.profile.bundles, [PACKAGE]);
 });

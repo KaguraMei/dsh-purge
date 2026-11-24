@@ -1,3 +1,4 @@
+import {createRequire} from 'node:module';
 /** Shared installer: selected Desktop's Electron runtime or Linux CLI's Node. */
 import fs from "node:fs";
 import os from "node:os";
@@ -169,14 +170,47 @@ export function verifyChecksum(bytes, text, filename) {
   if (matches.length !== 1 || matches[0][1].toLowerCase() !== createHash("sha256").update(bytes).digest("hex")) throw Error(`SHA256 verification failed: ${filename}`);
 }
 
+// BEGIN shared desktop CLI resolution (also embedded in lib/desktop-cli.js)
+export function desktopCliFromResources(resources, reader = fs) {
+  const physical = process.versions.electron && reader === fs ? createRequire(import.meta.url)('original-fs') : reader;
+  const exists = file => {
+    try { return reader.statSync(file).isFile(); }
+    catch (error) { if (['ENOENT', 'ENOTDIR'].includes(error.code)) return false; throw error; }
+  };
+  for (const layout of ['app.asar', 'app.asar.unpacked', 'app']) {
+    const root = path.join(resources, layout);
+    try { physical.statSync(root); } catch (error) { if (['ENOENT','ENOTDIR'].includes(error.code)) continue; throw error; }
+    for (const prefix of ['dsh/node_modules/@deepseek-ai', 'node_modules/@deepseek-ai']) {
+      const legacy = path.join(root, prefix, 'dsh-desktop-host/lib/cli.js');
+      const owned = file => {
+        const rel = path.relative(reader.realpathSync(resources), reader.realpathSync(file));
+        if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep)) throw Error('Bundled DSH CLI escapes its application');
+        return file;
+      };
+      if (exists(legacy)) return owned(legacy);
+      const pkg = path.join(root, prefix, 'dsh'), manifest = path.join(pkg, 'package.json');
+      if (!exists(manifest)) continue;
+      const meta = JSON.parse(reader.readFileSync(manifest, 'utf8'));
+      const bin = typeof meta.bin === 'string' ? meta.bin : meta.bin?.dsh;
+      if (meta.name !== '@deepseek-ai/dsh' || typeof bin !== 'string' || !bin || /[\\\x00-\x1f]/.test(bin))
+        throw Error('Invalid bundled DSH CLI manifest');
+      const cli = path.resolve(pkg, bin), rel = path.relative(pkg, cli);
+      if (path.isAbsolute(rel) || rel === '..' || rel.startsWith('..' + path.sep) || !exists(cli))
+        throw Error('Invalid bundled DSH CLI entry');
+      // A valid package cannot redirect the installer outside this application.
+      const realRoot = reader.realpathSync(pkg), realCli = reader.realpathSync(cli);
+      const realRel = path.relative(realRoot, realCli);
+      if (path.isAbsolute(realRel) || realRel === '..' || realRel.startsWith('..' + path.sep))
+        throw Error('Bundled DSH CLI escapes its package');
+      return owned(cli);
+    }
+  }
+  throw Error("Cannot find this DSH Desktop's CLI. Specify the installed DSH executable and actual profile; no other installation was selected.");
+}
+// END shared desktop CLI resolution
 export function desktopCli(executable, platform = process.platform) {
-  const resources = platform === "darwin"
-    ? path.resolve(executable, "../../Resources")
-    : path.join(path.dirname(executable), "resources");
-  const relative = "dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js";
-  const cli = ["app.asar", "app.asar.unpacked", "app"].map(layout => path.join(resources, layout, relative)).find(file => fs.existsSync(file));
-  if (!cli) throw Error("Cannot find this DSH Desktop's CLI. Specify the installed DSH executable, not a different Node runtime.");
-  return cli;
+  const resources = platform === 'darwin' ? path.resolve(executable, '../../Resources') : path.join(path.dirname(executable), 'resources');
+  return desktopCliFromResources(resources);
 }
 
 export function webCli(launcher = process.env.PURGE_DSH_CLI) {
@@ -260,7 +294,7 @@ export function prepareLinuxHost(cli, { userHome = os.homedir(), log = console.l
       copy(root, path.join(stage, "dsh"));
       fs.writeFileSync(path.join(stage, "manifest.json"), JSON.stringify({ managedBy: "dsh-purge-linux-host", identity, source: root, version: meta.version }, null, 2) + "\n", { mode: 0o600 });
       fs.renameSync(stage, destination);
-    } finally { fs.rmSync(stage, { recursive: true, force: true }); }
+    } finally { removeTreeNoFollowSync(stage); }
   }
   fs.accessSync(targetCli, fs.constants.X_OK);
   // Copy preparation is not activation. Migration may still fail, so leave
@@ -278,7 +312,7 @@ export function prepareLinuxHost(cli, { userHome = os.homedir(), log = console.l
     else if (fs.realpathSync(launcher) !== targetCli) {
       const stage = fs.mkdtempSync(path.join(path.dirname(launcher), ".purge-launcher-"));
       try { fs.symlinkSync(targetCli, path.join(stage, "dsh")); fs.renameSync(path.join(stage, "dsh"), launcher); }
-      finally { fs.rmSync(stage, { recursive: true, force: true }); }
+      finally { removeTreeNoFollowSync(stage); }
     }
     log(`User-owned DSH ready: ${launcher}. Quit the old DSH and launch this path to use it.`);
   };
@@ -288,12 +322,13 @@ export function prepareLinuxHost(cli, { userHome = os.homedir(), log = console.l
 export async function bootstrapInstall(options = {}) {
   const { request = fetch, download = {}, run = exec, log = console.log, executable = process.execPath, platform = process.platform,
     mode = process.env.PURGE_INSTALL_MODE || "desktop",
-    home = process.env.DSH_HOME || path.join(os.homedir(), ".dsh"), profile = process.env.DSH_PROFILE || (mode === "web" ? "web" : "desktop"), dryRun = false } = options;
+    home = process.env.DSH_HOME || path.join(os.homedir(), ".dsh"), profile = process.env.DSH_PROFILE || "", dryRun = false } = options;
   if (!["web", "desktop"].includes(mode)) throw Error("Invalid installation mode");
   if (Number(process.versions.node.split(".")[0]) < 18) throw Error("Node >=18 is required");
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(profile)) throw Error("Invalid profile name");
-  if (!fs.existsSync(path.join(home, "profiles", profile, "package.json"))) throw Error("Profile is not initialized; open DSH once first, or specify the correct home/profile.");
   let cli = options.cli || (mode === "web" ? webCli() : desktopCli(executable, platform));
+  const selectedProfile = profile || (mode === 'web' || /[/\\]dsh[/\\]lib[/\\]/.test(cli) ? 'web' : 'desktop');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(selectedProfile)) throw Error("Invalid profile name");
+  if (!fs.existsSync(path.join(home, "profiles", selectedProfile, "package.json"))) throw Error("Profile is not initialized; open DSH once first, or specify the correct home/profile.");
   const local = options.archiveFile !== undefined || options.sha256 !== undefined;
   if (local && (!options.archiveFile || !/^[a-f0-9]{64}$/i.test(options.sha256 || ""))) throw Error("Local install requires --archive and a 64-character --sha256");
   let version = options.version || (local ? /^dsh-purge-community-(\d+\.\d+\.\d+)\.tgz$/.exec(path.basename(options.archiveFile))?.[1] : undefined);
@@ -327,14 +362,14 @@ export async function bootstrapInstall(options = {}) {
     if (host) cli = host.cli;
     const result = await run(executable, [path.join(tmp, "package/bin/community.js"), "migrate", file], {
       timeout: 600000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DSH_SURFACE: mode, PURGE_DSH_CLI: cli, DSH_BASE: "", DSH_HOME: home, DSH_PROFILE: profile, PURGE_PROFILE_DIR: path.join(home, "profiles", profile) },
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", DSH_SURFACE: mode, PURGE_DSH_CLI: cli, DSH_BASE: "", DSH_HOME: home, DSH_PROFILE: selectedProfile, PURGE_PROFILE_DIR: path.join(home, "profiles", selectedProfile) },
     });
     host?.activate?.();
     if (result.stdout?.trim()) log(result.stdout.trim());
     if (result.stderr?.trim()) log(result.stderr.trim());
     log("Installed. Settings preserved. Quit and reopen DSH manually when convenient; no restart or host patch was performed.");
     return { version, installed: true };
-  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  } finally { removeTreeNoFollowSync(tmp); }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
@@ -351,3 +386,37 @@ if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process
     await bootstrapInstall(options);
   } catch (error) { console.error(error.stderr || error.message); process.exitCode = 1; }
 }
+
+// BEGIN standalone no-follow cleanup (checked against lib/remove-tree.js)
+function removeTreeNoFollowSync(target, options = {}) {
+  const io = options.fs || fs;
+  const root = path.resolve(target);
+  if (root === path.parse(root).root) throw Error('Refusing to remove a filesystem root');
+  const maxRetries = options.maxRetries ?? 0;
+  const retryDelay = options.retryDelay ?? 100;
+  const retryable = new Set(['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM']);
+  const walk = file => {
+    let stat;
+    try { stat = io.lstatSync(file); } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    // lstat must come before isDirectory: never stat / realpath a deletion target.
+    try {
+      if (stat.isSymbolicLink()) { io.unlinkSync(file); return; }
+      if (stat.isDirectory()) {
+        for (const name of io.readdirSync(file)) walk(path.join(file, name));
+        io.rmdirSync(file); // Non-recursive: no native recursive rm fallback.
+      } else io.unlinkSync(file);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  };
+  for (let attempt = 0; ; attempt++) {
+    try { walk(root); return; } catch (error) {
+      if (error.code === 'ENOENT') return;
+      if (attempt >= maxRetries || !retryable.has(error.code)) throw error;
+      // Each retry re-lstats every remaining entry, including the root.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, retryDelay * (attempt + 1));
+    }
+  }
+}
+// END standalone no-follow cleanup

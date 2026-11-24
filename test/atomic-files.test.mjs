@@ -72,6 +72,9 @@ function desktopFixture() {
   const exe = path.join(root, "DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness");
   fs.mkdirSync(path.dirname(exe), { recursive: true }); fs.writeFileSync(exe, "fixture");
   fs.mkdirSync(path.join(resources, "app"), { recursive: true });
+ const host=path.join(resources,'app/dsh/node_modules/@deepseek-ai/dsh-desktop-host');
+ fs.mkdirSync(path.join(host,'lib'),{recursive:true});fs.writeFileSync(path.join(host,'lib/cli.js'),'// fixture');
+ fs.writeFileSync(path.join(host,'package.json'),JSON.stringify({name:'@deepseek-ai/dsh-desktop-host'}));
   const pnpm = path.join(resources, "runtime", PNPM_ENTRY);
   fs.mkdirSync(path.dirname(pnpm), { recursive: true }); fs.writeFileSync(pnpm, "fixture");
   const shim = path.join(resources, "runtime/cli/bin/dsh");
@@ -111,4 +114,31 @@ test("CLI backup failure reports failure and does not replace the launcher", () 
     assert.equal(fs.readFileSync(f.shim, "utf8"), f.content);
     assert(!fs.readdirSync(path.dirname(f.shim)).some(n => n.endsWith(".tmp")));
   } finally { f.close(); }
+});
+
+test("private durable replacements flush before rename and preserve old bytes on flush failure", async t => {
+  const root = tmp();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "private", "state");
+  const events = [];
+  const io = {
+    ...fs,
+    fsyncSync(fd) { events.push("flush"); fs.fsyncSync(fd); },
+    renameSync(src, dst) { events.push("publish"); fs.renameSync(src, dst); },
+  };
+  const write = value => atomicFiles(io).atomicWriteSync(file, value, "utf8", {
+    exactMode: 0o600, directoryMode: 0o700, durable: true,
+  });
+  write(Buffer.from([0, 255]));
+  if (process.platform !== "win32") fs.chmodSync(file, 0o644);
+  write("private");
+  assert.deepEqual(events, ["flush", "publish", "flush", "publish"]);
+  if (process.platform !== "win32") {
+    assert.equal(mode(file), 0o600);
+    assert.equal(mode(path.dirname(file)), 0o700);
+  }
+  io.fsyncSync = () => { throw Object.assign(new Error("disk flush failed"), { code: "EIO" }); };
+  assert.throws(() => write("lost"), { code: "EIO" });
+  assert.equal(fs.readFileSync(file, "utf8"), "private");
+  assert.deepEqual(fs.readdirSync(path.dirname(file)), ["state"]);
 });

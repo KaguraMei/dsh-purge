@@ -1,4 +1,7 @@
+import { apiUrl } from "../api/client.js";
 // UI derived from YuJunZhiXue/dsh-purge 1.1.71 (MIT). See LICENSE.
+import { incompleteApplyDetail } from "../shared/apply-result.js";
+import { runtimeRepairDetails } from "../shared/runtime-error.js";
 import {
   h,
   useState,
@@ -12,15 +15,19 @@ import {
   hostSurfaceOf,
   hostText,
   apiJson,
+  unavailableStatus,
   promptBoxEmpty,
   responseNeedsPrompt,
   bothInjectEmpty,
 } from "../api/client.js";
 import {
   shimKind,
-  patchRowsOf,
-  tallyPatches,
+  patchEvidence,
+  patchGroupCounts,
   PatchGroups,
+  PatchHealth,
+  PatchGroupSwitches,
+  PatchApplySteps,
 } from "./patch-status.js";
 import { noticeNode, Btn } from "./primitives.js";
 import { HooksDenySection } from "./advanced.js";
@@ -37,6 +44,7 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
   const tRef = useRef(t);
   tRef.current = t;
   const [state, setState] = useState(null);
+  const [scannedAt, setScannedAt] = useState(null);
   useEffect(() => {
     if (onStatus) onStatus(state);
   }, [state, onStatus]);
@@ -288,41 +296,39 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
       .then((d) => {
         if (d && d.ok) {
           setState(d);
+          try {
+            setScannedAt(
+              new Date().toLocaleTimeString("zh-CN", {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+              }),
+            );
+          } catch {}
+          setNotice((previous) =>
+            previous?.source === "status"
+              ? { kind: "idle", text: "" }
+              : previous,
+          );
           if (d.channel) setChannel(d.channel);
           if (d.update && d.update.ok && !d.update.error)
             setUpdateInfo(d.update);
           if (d.boot_full_quit && !suppressRestartAsk.current)
             setAskRestart(true);
         } else {
-          setState({
-            ok: false,
-            patches_total: 0,
-            patches_applied: 0,
-            patch_status: {},
-            shim_cmd: "n/a",
-            shim_ps1: "n/a",
-            shim_bin: "n/a",
-            has_backup: false,
-          });
+          setState(unavailableStatus(d?.error || "bad response"));
           setNotice({
             kind: "error",
+            source: "status",
             text: tr("err.status", { error: (d && d.error) || "bad response" }),
           });
         }
       })
       .catch((e) => {
-        setState({
-          ok: false,
-          patches_total: 0,
-          patches_applied: 0,
-          patch_status: {},
-          shim_cmd: "n/a",
-          shim_ps1: "n/a",
-          shim_bin: "n/a",
-          has_backup: false,
-        });
+        setState(unavailableStatus(e));
         setNotice({
           kind: "error",
+          source: "status",
           text: tr("err.status", { error: e.message }),
         });
       });
@@ -392,7 +398,7 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
         setAskRestart(false);
         setNotice({ kind: "idle", text: "" });
         const applyContent = action === "apply" ? readPromptBox() : "";
-        fetch("/dsh-purge/" + action, {
+        fetch(apiUrl("/dsh-purge/" + action), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(
@@ -409,7 +415,13 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
             if (!d.ok) {
               setNotice({
                 kind: "error",
-                text: tr("err.action", { action: label, error: d.error || "" }),
+                text: tr("err.action", {
+                  action: label,
+                  error: [
+                    d.error || "",
+                    ...runtimeRepairDetails(d.cli_repair),
+                  ].join("\n"),
+                }),
               });
               return;
             }
@@ -422,33 +434,11 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
               }
             }
             if (action === "apply" && d.complete === false) {
-              const parts = [];
-              if (d.failed > 0) {
-                const ids = (d.failed_items || [])
-                  .map((x) => x.id)
-                  .filter((id) => id != null)
-                  .join(",");
-                parts.push(
-                  tr("restart.incomplete.patches", {
-                    failed: String(d.failed || 0),
-                    ids: ids || "?",
-                  }),
-                );
-              }
-              if (d.cmd_flash && d.cmd_flash.ok === false) {
-                parts.push(
-                  tr("restart.incomplete.flash", {
-                    entry: String(d.cmd_flash.entry || "fail"),
-                  }),
-                );
-              }
-              if (parts.length === 0)
-                parts.push(
-                  tr("restart.incomplete.flash", { entry: "unknown" }),
-                );
               setNotice({
                 kind: "error",
-                text: tr("restart.incomplete", { detail: parts.join("；") }),
+                text: tr("restart.incomplete", {
+                  detail: incompleteApplyDetail(d, tr),
+                }),
               });
               loadAll();
               if (d.restarting || d.needs_full_quit) {
@@ -621,7 +611,7 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
   const waitHostAfterUninstall = useCallback((tr) => {
     const started = Date.now();
     const ping = () => {
-      fetch("/", { cache: "no-store", credentials: "same-origin" })
+      fetch(apiUrl("/"), { cache: "no-store", credentials: "same-origin" })
         .then((r) => {
           if (r.ok) {
             try {
@@ -707,21 +697,9 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
     !located &&
     desktopLikely &&
     !!(s && (s.asar_still_sealed || s.desktop_exe || s.desktop_install));
-  const patchesLost = !located && !!(s && s.patches_lost);
-  const tally = located
-    ? tallyPatches(patchRowsOf(s))
-    : { applied: 0, pending: 0, unmatched: 0, skipped: 0, total: 0 };
-  const total = tally.total;
-  const applied = tally.applied;
-  const pct = located && total ? Math.round((applied / total) * 100) : 0;
-  const metricNotes = [];
-  if (tally.pending)
-    metricNotes.push(t("metric.pendingShort", { n: tally.pending }));
-  if (tally.unmatched)
-    metricNotes.push(t("metric.unmatchedShort", { n: tally.unmatched }));
-  if (tally.skipped)
-    metricNotes.push(t("metric.skipShort", { n: tally.skipped }));
-
+  const evidence = patchEvidence(s);
+  const counts =
+    evidence.kind === "detail" ? patchGroupCounts(evidence.rows) : null;
   const versions = (updateInfo && updateInfo.versions) || [];
   const channelNow = (updateInfo && updateInfo.channel) || channel || "stable";
   const localVer =
@@ -833,54 +811,25 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
     h(
       "div",
       { hidden: page !== "status" },
+      // 标题行：左侧页面名，右侧操作组 + 扫描时间（对齐样稿，不再用 hero 卡包一层）
       h(
         "div",
-        { className: "dshpp-hero" },
+        { className: "dshpp-status-head" },
+        h("h3", { className: "dshpp-status-title" }, t("status.title")),
         h(
           "div",
-          { className: "dshpp-hero-state" },
-          h("i", {
-            className:
-              "dshpp-dot " +
-              (!located
-                ? "is-warn"
-                : patchBusy
-                  ? ""
-                  : s?.asar_still_sealed || tally.pending
-                    ? "is-warn"
-                    : "is-ok"),
-          }),
-          h(
-            "b",
-            null,
-            !located
-              ? sealedReady
-                ? "宿主还没解开：点「应用」"
-                : "未定位到宿主：点「应用」重试"
-              : s?.asar_still_sealed
-                ? `${applied}/${total} 条磁盘补丁（退出重开后加载）`
-                : tally.pending
-                  ? `还有 ${tally.pending} 条待应用`
-                  : `${applied}/${total} 条补丁已生效`,
-          ),
-          h(
-            "span",
-            { className: "dshpp-hero-sub" },
-            t("surface." + hostSurface),
-          ),
-        ),
-        h(
-          "div",
-          { className: "dshpp-hero-actions" },
+          { className: "dshpp-status-ops" },
           h(
             Btn,
             {
               kind: "primary",
-              className: "dshpp-btn-lead",
+              className: "dshpp-btn-apply",
               disabled: patchBusy || uninstallBusy || !overrideLoaded,
               onClick: () => doAction("apply", "action.apply"),
             },
-            patchBusy ? t("btn.apply.busy") : t("btn.apply"),
+            patchBusy
+              ? t("btn.apply.busy")
+              : t("btn.apply") + (counts?.pending ? " " + counts.pending : ""),
           ),
           h(
             Btn,
@@ -901,60 +850,52 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
             uninstallBusy ? t("btn.uninstall.busy") : t("btn.uninstall"),
           ),
           h(
-            Btn,
+            "button",
             {
-              tiny: true,
+              type: "button",
+              className: "dshpp-scan",
               onClick: loadAll,
               disabled: patchBusy || uninstallBusy,
+              title: t("scan.hint"),
             },
-            "刷新",
+            scannedAt ? t("scan.recent", { time: scannedAt }) : t("scan.hint"),
           ),
         ),
-        h(
-          "p",
-          { className: "dshpp-hero-hint" },
-          "装好插件、更新过 DSH、或发现模型又开始推脱时：点一次「应用」，然后退出并重开 DSH，就会恢复。",
-        ),
-        noticeNode(notice),
       ),
+      !located
+        ? h(
+            "p",
+            { className: "dshpp-status-note" },
+            sealedReady ? "宿主还没解开：点「应用」" : t("metric.unlocated"),
+          )
+        : null,
+      noticeNode(notice),
+      h(PatchHealth, { state: s }),
+      h(PatchGroupSwitches, { state: s, onSaved: loadAll }),
       h(
-        "div",
-        { className: "dshpp-rel" },
+        "section",
+        { className: "dshpp-fold is-open" },
         h(
-          "div",
-          { className: "dshpp-now" },
-          h("span", { className: "dshpp-now-label" }, t("channel.local")),
+          "h4",
+          { className: "dshpp-fold-t" },
+          t("detail.title"),
           h(
-            "b",
-            { className: "dshpp-now-ver" },
-            localVer ? "v" + localVer : "—",
-          ),
-          h("em", { className: "dshpp-now-mark" }, t("update.current")),
-        ),
-        h(
-          "details",
-          { className: "dshpp-editions" },
-          h("summary", null, "版本管理"),
-          renderEdition("stable"),
-          renderEdition("beta"),
-        ),
-        noticeNode(updateNotice),
-      ),
-      h(
-        "details",
-        { className: "dshpp-fold" },
-        h(
-          "summary",
-          null,
-          "补丁明细 ",
-          h(
-            "b",
-            null,
-            s && s.ai_base ? `${applied}/${total} 已应用` : "未定位宿主",
+            "span",
+            { className: "dshpp-fold-n" },
+            !s
+              ? t("detail.reading")
+              : s.ok === false
+                ? t("detail.unknown")
+                : s.ai_base
+                  ? counts
+                    ? `${counts.applied} / ${counts.denom}`
+                    : t("evidence." + evidence.kind)
+                  : t("detail.unlocated"),
           ),
         ),
         h(PatchGroups, { state: s }),
       ),
+      h(PatchApplySteps, null),
       h(
         "details",
         null,
@@ -1015,7 +956,7 @@ export function PurgifySection({ page = "status", onStatus } = {}) {
         },
         t("apply.hint"),
       ),
-      s && !s.ai_base
+      s?.ok === true && !s.ai_base
         ? h(
             "p",
             {

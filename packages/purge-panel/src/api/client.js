@@ -1,4 +1,5 @@
 // UI derived from YuJunZhiXue/dsh-purge 1.1.71 (MIT). See LICENSE.
+import { runtimeRepairDetails } from "../shared/runtime-error.js";
 
 export function clientGuessSurface() {
   try {
@@ -38,9 +39,38 @@ export function hostText(t, key, surface) {
   return t(key);
 }
 
-export function apiUrl(p) {
+// The loaded plugin URL is the strongest evidence of the host mount point.
+// An unrelated/cross-origin <base> must never receive authenticated API calls.
+export function apiUrl(p, context = {}) {
   try {
-    return new URL(p, window.location.origin).toString();
+    const loc =
+      context.href || window.location.href || window.location.origin + "/";
+    const page = new URL(loc);
+    const module = new URL(
+      context.moduleUrl ||
+        (typeof __PURGE_MODULE_URL__ !== "undefined" && __PURGE_MODULE_URL__) ||
+        page.href,
+      page,
+    );
+    let base;
+    const marker = module.pathname.indexOf("/plugins/");
+    if (module.origin === page.origin && marker >= 0) {
+      base = new URL(module.pathname.slice(0, marker + 1), page);
+    } else {
+      const declared =
+        context.baseURI ||
+        (typeof document !== "undefined" && document.baseURI);
+      const candidate = declared && new URL(declared, page);
+      base = candidate && candidate.origin === page.origin ? candidate : page;
+      base = new URL(base.href);
+      // Host routes are client-side hash routes; a slashless mount is a directory.
+      if (!base.pathname.endsWith("/")) base.pathname += "/";
+    }
+    base.search = "";
+    base.hash = "";
+    if (typeof p !== "string" || !p.startsWith("/") || p.startsWith("//"))
+      return p;
+    return new URL(p.slice(1), base).toString();
   } catch {
     return p;
   }
@@ -73,7 +103,29 @@ function apiError(message, status) {
   return Object.assign(new Error(message), { status });
 }
 
-export async function apiJson(p, init) {
+// Share only an identical in-flight status GET; never reuse a settled result.
+// A mutation starts a new generation so its following refresh cannot join an old read.
+let pendingStatus = null;
+export function apiJson(p, init) {
+  const method = String(init?.method || "GET").toUpperCase();
+  if (method !== "GET") pendingStatus = null;
+  if (p !== "/dsh-purge/status" || init) return requestJson(p, init);
+  if (pendingStatus) return pendingStatus;
+  const request = requestJson(p, init);
+  pendingStatus = request;
+  const clear = () => {
+    if (pendingStatus === request) pendingStatus = null;
+  };
+  request.then(clear, clear);
+  return request;
+}
+export function unavailableStatus(error) {
+  return {
+    ok: false,
+    error: String(error?.message || error || "bad response"),
+  };
+}
+async function requestJson(p, init) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), apiTimeoutMs(p, init));
   try {
@@ -91,16 +143,20 @@ export async function apiJson(p, init) {
     } catch {
       throw apiError(r.status + " non-json: " + text.slice(0, 120), r.status);
     }
-    if (!r.ok)
-      throw apiError(
-        (data && (data.error || data.message)) || r.status + " " + r.statusText,
-        r.status,
+    if (!r.ok) {
+      const runtimeDetails = runtimeRepairDetails(data?.cli_repair);
+      const message =
+        (data && (data.error || data.message)) || r.status + " " + r.statusText;
+      throw Object.assign(
+        apiError([message, ...runtimeDetails].join("\n"), r.status),
+        { runtimeDetails },
       );
+    }
     return data;
   } catch (e) {
     if (isAbortError(e)) throw new Error("timeout");
     const msg = String((e && e.message) || e || "");
-    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+    if (!e?.status && /failed to fetch|networkerror|load failed/i.test(msg)) {
       throw new Error("连不上接口，请确认 dsh 还在跑后 Ctrl+F5");
     }
     throw e;
